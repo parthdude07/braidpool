@@ -1,24 +1,19 @@
 import axios from 'axios';
 
+export let latestMempoolPayload = null;
+
+const FIAT_CURRENCIES = ['USD', 'EUR', 'JPY', 'GBP', 'CAD', 'AUD', 'CHF', 'INR', 'KRW', 'BRL', 'HKD', 'SGD'];
+
 async function getBlockFeeCurrencyRates() {
   try {
-    const [usdRes, eurRes, jpyRes] = await Promise.all([
-      axios.get(
-        `${process.env.BITCOIN_PRICE_URL}USD${process.env.BITCOIN_PRICE_URL_SUFFIX}`
-      ),
-      axios.get(
-        `${process.env.BITCOIN_PRICE_URL}EUR${process.env.BITCOIN_PRICE_URL_SUFFIX}`
-      ),
-      axios.get(
-        `${process.env.BITCOIN_PRICE_URL}JPY${process.env.BITCOIN_PRICE_URL_SUFFIX}`
-      ),
-    ]);
-
-    return {
-      USD: parseFloat(usdRes.data.data.amount),
-      EUR: parseFloat(eurRes.data.data.amount),
-      JPY: parseFloat(jpyRes.data.data.amount),
-    };
+    const results = await Promise.all(
+      FIAT_CURRENCIES.map((c) =>
+        axios.get(`${process.env.BITCOIN_PRICE_URL}${c}${process.env.BITCOIN_PRICE_URL_SUFFIX}`)
+      )
+    );
+    return Object.fromEntries(
+      FIAT_CURRENCIES.map((c, i) => [c, parseFloat(results[i].data.data.amount)])
+    );
   } catch (err) {
     console.error('[getBlockFeeCurrencyRates] Failed:', err.message);
     throw err;
@@ -57,16 +52,13 @@ export async function fetchMempoolStats() {
     const { fastestFee, halfHourFee, hourFee, economyFee, minimumFee } =
       feesRes.data;
 
-    const btcPriceUSD = btcRates['USD'];
-
     const convertFee = (sats) => {
       const feeBtc = sats / 1e8;
-      const feeUsd = feeBtc * btcPriceUSD;
-      return {
-        sats_per_vbyte: sats,
-        fee_btc: feeBtc,
-        fee_usd: feeUsd,
-      };
+      const fee = { sats_per_vbyte: sats, fee_btc: feeBtc };
+      for (const [currency, rate] of Object.entries(btcRates)) {
+        fee[`fee_${currency.toLowerCase()}`] = feeBtc * rate;
+      }
+      return fee;
     };
 
     const blockFeesArray = blockfeesRes.data;
@@ -75,28 +67,30 @@ export async function fetchMempoolStats() {
         ? blockFeesArray[blockFeesArray.length - 1]
         : null;
 
-    const blockfeeHistory = latestBlockFeeRaw
-      ? [
-          {
-            height: latestBlockFeeRaw.avgHeight,
-            time: new Date(
-              (latestBlockFeeRaw.timestamp || 0) * 1000
-            ).toLocaleTimeString(),
-            btc: latestBlockFeeRaw.avgFees / 1e8,
-            usd: latestBlockFeeRaw.USD / 100,
-            eur: (latestBlockFeeRaw.avgFees / 1e8) * btcRates.EUR,
-            jpy: (latestBlockFeeRaw.avgFees / 1e8) * btcRates.JPY,
-          },
-        ]
-      : [];
+    const blockfeeHistory = (() => {
+      if (!latestBlockFeeRaw) return [];
+      const feeBtc = latestBlockFeeRaw.avgFees / 1e8;
+      const item = {
+        height: latestBlockFeeRaw.avgHeight,
+        time: new Date(
+          (latestBlockFeeRaw.timestamp || 0) * 1000
+        ).toLocaleTimeString(),
+        btc: feeBtc,
+      };
+      for (const [currency, rate] of Object.entries(btcRates)) {
+        item[currency.toLowerCase()] = feeBtc * rate;
+      }
+      return [item];
+    })();
 
-    return {
-      mempool: {
-        count,
-        vsize,
-        total_fee_btc: total_fee / 1e8,
-        total_fee_usd: (total_fee / 1e8) * btcPriceUSD,
-      },
+    const totalFeeBtc = total_fee / 1e8;
+    const mempool = { count, vsize, total_fee_btc: totalFeeBtc };
+    for (const [currency, rate] of Object.entries(btcRates)) {
+      mempool[`total_fee_${currency.toLowerCase()}`] = totalFeeBtc * rate;
+    }
+
+    const result = {
+      mempool,
       next_block_fees: convertFee(fastestFee),
       fees: {
         high_priority: convertFee(fastestFee),
@@ -105,10 +99,18 @@ export async function fetchMempoolStats() {
         economy: convertFee(economyFee),
         minimum: convertFee(minimumFee),
       },
-      btc_price_usd: btcPriceUSD,
+      btc_price_usd: btcRates.USD,
       fee_distribution: feeDistribution,
       block_fee_history: blockfeeHistory,
     };
+
+    latestMempoolPayload = {
+      type: 'mempool_update',
+      data: result,
+      time: new Date().toLocaleString(),
+    };
+
+    return result;
   } catch (error) {
     console.error('[fetchMempoolStats] Failed to fetch:', error.message);
     return null;
